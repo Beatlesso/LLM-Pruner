@@ -23,6 +23,7 @@ def get_c4(tokenizer, n_samples, seq_len):
     return torch.cat(tokenized_samples, dim=0)
 
 def get_bookcorpus(tokenizer, n_samples, seq_len):
+    # 加载数据集
     traindata = load_dataset(
         'bookcorpus', split='train'
     )
@@ -30,15 +31,20 @@ def get_bookcorpus(tokenizer, n_samples, seq_len):
     tokenized_samples, history = [], []
     for _ in range(n_samples):
         while True:
+            # 随机获取一个样例下标
             i = random.randint(0, len(traindata) - 1)
+            # 拿对应的样例输入编码
             tokenized_sample = tokenizer(traindata[i]['text'], return_tensors='pt')
+            # 如果编码长度大于等于seq_len，并且不在history中，将它加到history中
             if tokenized_sample.input_ids.shape[1] >= seq_len and i not in history:
                 history.append(i)
                 break
+        # 随机取一段长度为seq_len的子串添加到tokenized_samples中
         i = random.randint(0, tokenized_sample.input_ids.shape[1] - seq_len)
         tokenized_samples.append(tokenized_sample.input_ids[:, i:i+seq_len])
     return torch.cat(tokenized_samples, dim=0 )
 
+# 从相应的数据集中获取样例
 def get_examples(dataset, tokenizer, n_samples, seq_len = 128):
     if dataset == 'c4':
         return get_c4(tokenizer, n_samples, seq_len)

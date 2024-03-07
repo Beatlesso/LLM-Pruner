@@ -25,7 +25,7 @@ class MetaPruner:
 
             round_to (int): channel rounding.
             customized_pruners (dict): a dict containing module-pruner pairs.
-            unwrapped_parameters (list): nn.Parameter that does not belong to any supported layerss.
+            unwrapped_parameters (list): nn.Parameter that does not belong to any supported layers.
             root_module_types (list): types of prunable modules.
             output_transform (Callable): A function to transform network outputs.
         """
@@ -35,6 +35,7 @@ class MetaPruner:
         # Basic
         model: nn.Module,
         example_inputs: torch.Tensor,
+        # Callable表示是一个可调用对象类型
         importance: typing.Callable,
         # https://pytorch.org/tutorials/intermediate/pruning_tutorial.html#global-pruning.
         global_pruning: bool = False,
@@ -77,6 +78,7 @@ class MetaPruner:
         self.round_to = round_to
 
         # Build dependency graph
+        # 首先构造输入，前向运行一次模型，得到模型对应的计算图
         self.DG = dependency.DependencyGraph().build_dependency(
             model,
             example_inputs=example_inputs,
@@ -85,7 +87,13 @@ class MetaPruner:
             unwrapped_parameters=unwrapped_parameters,
             customized_pruners=customized_pruners,
         )
-
+        '''
+        list1 = ['Google', 'Runoob', 'Taobao']
+        list2=list(range(5)) # 创建 0-4 的列表
+        list1.extend(list2)  # 扩展列表
+        print ("扩展后的列表：", list1)
+        扩展后的列表： ['Google', 'Runoob', 'Taobao', 0, 1, 2, 3, 4]
+        '''
         self.ignored_layers = []
         if ignored_layers:
             for layer in ignored_layers:
@@ -109,10 +117,12 @@ class MetaPruner:
         )
 
         # The customized channel sparsity for different layers
+        # 针对不同层的定制化稀疏率
         self.ch_sparsity_dict = {}
         if ch_sparsity_dict is not None:
             for module in ch_sparsity_dict:
                 sparsity = ch_sparsity_dict[module]
+                # 取出每一个模块的子模块
                 for submodule in module.modules():
                     prunable_types = tuple([ops.type2class(
                         prunable_type) for prunable_type in self.DG.REGISTERED_PRUNERS.keys()])

@@ -132,12 +132,14 @@ def main(args):
 
         logger.log("Start Pruning")
         for i in range(args.iterative_steps):
-            # 如果是泰勒展开剪枝方法
+            # 泰勒展开剪枝
             if pruner_type in ['taylor']:
-                # 从数据集中
+                # 从数据集中随机获取num_examples个长度为seq_len的token编码后的id
                 example_prompts = get_examples('bookcorpus', tokenizer, args.num_examples, seq_len = 64).to(args.device)
                 logger.log("Start Backwarding in iterative steps = {}...".format(i))
+                # param_mix表示泰勒展开第一项第二项都考虑，param_second只考虑第二项
                 if args.taylor in ['param_mix', 'param_second']:
+                    # 单独计算每一个样例求acc_grad
                     for j in range(args.num_examples):
                         batch_input = example_prompts[j].unsqueeze(0)
                         loss = model(batch_input, labels=batch_input).loss
@@ -146,23 +148,31 @@ def main(args):
 
                         for module_param in model.parameters():
                             module_param.grad = module_param.grad * module_param.grad / args.num_examples
+                            # 判断是否累加梯度
                             if hasattr(module_param, 'acc_grad'):
                                 module_param.acc_grad += module_param.grad
                             else:
                                 module_param.acc_grad = copy.deepcopy(module_param.grad)
+                        # 这里清空grad  不会清空acc_grad
+                        # 如果累加梯度，那么最终结果就是 ([grad_1]^2 + ... + [grad_num]^2) / num
+                        # 否则就是 [grad_num]^2 / num
                         model.zero_grad()
                         del loss.grad
-                    
+                        
+
+                # 计算所有样例的损失和梯度 
                 loss = model(example_prompts, labels=example_prompts).loss
                 logger.log("Loss = {}".format(loss))
                 loss.backward()
-
+             
+            # 根据累积的梯度信息进行剪枝
             pruner.step()
-
+            # 统计剪枝后的模型参数量
             after_pruning_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
             logger.log("After Iter {}/{}, #parameters: {}".format(i+1, args.iterative_steps, after_pruning_parameters))
         
             # modify inferece-related attributes
+            # 修改多头的数目
             for layer in model.model.layers:
                 layer.self_attn.num_heads = layer.self_attn.q_proj.weight.data.shape[0] // layer.self_attn.head_dim
 
@@ -173,6 +183,7 @@ def main(args):
                 module.grad = None
 
         del pruner
+    
     # 按通道进行剪枝
     elif args.channel_wise:
         kwargs = {

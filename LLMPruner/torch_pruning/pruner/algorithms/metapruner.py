@@ -106,7 +106,9 @@ class MetaPruner:
         # Record initial status
         self.layer_init_out_ch = {}
         self.layer_init_in_ch = {}
+        # module2node：通过跟踪构建计算图
         for m in self.DG.module2node.keys():
+            # 如果计算图内的模块是支持的类型，那么获取其输入和输出通道数
             if ops.module2type(m) in self.DG.REGISTERED_PRUNERS:
                 self.layer_init_out_ch[m] = self.DG.get_out_channels(m)
                 self.layer_init_in_ch[m] = self.DG.get_in_channels(m)
@@ -124,14 +126,18 @@ class MetaPruner:
                 sparsity = ch_sparsity_dict[module]
                 # 取出每一个模块的子模块
                 for submodule in module.modules():
+                    # prunable_types是支持的剪枝模块类别元组集合
                     prunable_types = tuple([ops.type2class(
                         prunable_type) for prunable_type in self.DG.REGISTERED_PRUNERS.keys()])
+                    # 如果子模块是支持的，那么为其添加迭代稀疏调度
                     if isinstance(submodule, prunable_types):
                         self.ch_sparsity_dict[submodule] = self.iterative_sparsity_scheduler(
                             sparsity, self.iterative_steps
                         )
 
+        # model.modules()迭代遍历模型的所有nn.Module子类
         # detect group convs & group norms
+        # 检测分组卷积核分组norm 并且获取它们的分组数
         for m in self.model.modules():
             if isinstance(m, ops.TORCH_CONV) \
                 and m.groups > 1 \

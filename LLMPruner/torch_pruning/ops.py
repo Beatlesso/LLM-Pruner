@@ -103,6 +103,7 @@ except:
 TORCH_OTHERS = None
 
 
+# 操作代号
 class OPTYPE(IntEnum):
     CONV = 0
     BN = 1

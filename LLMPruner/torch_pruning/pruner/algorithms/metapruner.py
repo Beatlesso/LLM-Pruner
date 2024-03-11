@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import typing
+import sys
+import logging
 
 from .scheduler import linear_scheduler
 from ..import function
@@ -43,12 +45,13 @@ class MetaPruner:
         ch_sparsity_dict: typing.Dict[nn.Module, float] = None,
         max_ch_sparsity: float = 1.0,
         iterative_steps: int = 1,  # for iterative pruning
+        # iterative_sparsity_scheduler(ch_sparsity, steps) 将 ch_sparsity 按照 iterative_steps进行等分
         iterative_sparsity_scheduler: typing.Callable = linear_scheduler,
         ignored_layers: typing.List[nn.Module] = None,
 
         # Advanced
         round_to: int = None,  # round channels to 8x, 16x, ...
-        # for grouped channels.
+        # for grouped channels.  记录不同模块分组操作（比如分组卷积）的分组数
         channel_groups: typing.Dict[nn.Module, int] = dict(),
         # for consecutive channels.
         consecutive_groups: typing.Dict[nn.Module, int] = dict(),
@@ -78,7 +81,7 @@ class MetaPruner:
         self.round_to = round_to
 
         # Build dependency graph
-        # 首先构造输入，前向运行一次模型，得到模型对应的计算图
+        # 首先构造输入，前向运行一次模型，得到模型对应的计算依赖图
         self.DG = dependency.DependencyGraph().build_dependency(
             model,
             example_inputs=example_inputs,
@@ -94,6 +97,7 @@ class MetaPruner:
         print ("扩展后的列表：", list1)
         扩展后的列表： ['Google', 'Runoob', 'Taobao', 0, 1, 2, 3, 4]
         '''
+        # 这里即用扩展的方式将ignored_layers的内容存储到self.ignored_layers
         self.ignored_layers = []
         if ignored_layers:
             for layer in ignored_layers:
@@ -108,12 +112,13 @@ class MetaPruner:
         self.layer_init_in_ch = {}
         # module2node：通过跟踪构建计算图
         for m in self.DG.module2node.keys():
-            # 如果计算图内的模块是支持的类型，那么获取其输入和输出通道数
+            # module2type：获取模块对应的类型
             if ops.module2type(m) in self.DG.REGISTERED_PRUNERS:
                 self.layer_init_out_ch[m] = self.DG.get_out_channels(m)
                 self.layer_init_in_ch[m] = self.DG.get_in_channels(m)
 
         # global channel sparsity for each iterative step
+        # 获取全局稀疏度对应的稀疏度迭代计划
         self.per_step_ch_sparsity = self.iterative_sparsity_scheduler(
             self.ch_sparsity, self.iterative_steps
         )
@@ -126,10 +131,10 @@ class MetaPruner:
                 sparsity = ch_sparsity_dict[module]
                 # 取出每一个模块的子模块
                 for submodule in module.modules():
-                    # prunable_types是支持的剪枝模块类别元组集合
+                    # prunable_types是获取所有子模块中支持剪枝的模块类别元组集合
                     prunable_types = tuple([ops.type2class(
                         prunable_type) for prunable_type in self.DG.REGISTERED_PRUNERS.keys()])
-                    # 如果子模块是支持的，那么为其添加迭代稀疏调度
+                    # 如果子模块是支持的，那么为其添加定制的迭代稀疏调度
                     if isinstance(submodule, prunable_types):
                         self.ch_sparsity_dict[submodule] = self.iterative_sparsity_scheduler(
                             sparsity, self.iterative_steps
@@ -146,13 +151,18 @@ class MetaPruner:
             if isinstance(m, ops.TORCH_GROUPNORM):
                 self.channel_groups[m] = m.num_groups
         
+        # 如果启用全局剪枝
         if self.global_pruning: # TODO: Support both ch_groups and consecutive_groups in a single forward
             initial_total_channels = 0
+            # self.DG.get_all_groups获取所有的分组
             for group in self.DG.get_all_groups(ignored_layers=self.ignored_layers, root_module_types=self.root_module_types, root_instances=self.root_instances):
+                # 获取当前组的模块的操作分组数
                 ch_groups = self.get_channel_groups(group)
+                # 获取当前组的模块的连续分组
                 consecutive_groups = self.get_consecutive_groups(group)
                 # utils.count_prunable_out_channels( group[0][0].target.module )
 
+                # 根据情况更新总通道数，因为模块操作分组会划分成不同的依赖组
                 if ch_groups > 1:
                     initial_total_channels += (self.DG.get_out_channels(
                         group[0][0].target.module) // ch_groups)
@@ -168,28 +178,35 @@ class MetaPruner:
             for node in self.DG.module2node.values():
                 node.enable_index_mapping = True
     
+    # 获取剪枝历史
     def pruning_history(self):
         return self.DG.pruning_history()
-
+    # 加载剪枝历史
     def load_pruning_history(self, pruning_history):
         self.DG.load_pruning_history(pruning_history)
 
+    # 获取当前迭代的模块目标稀疏度
     def get_target_sparsity(self, module):
         s = self.ch_sparsity_dict.get(module, self.per_step_ch_sparsity)[
             self.current_step]
         return min(s, self.max_ch_sparsity)
 
+    # 将当前迭代步数设为0
     def reset(self):
         self.current_step = 0
 
+    # 模型正则化方法
     def regularize(self, model, loss):
         """ Model regularizor
         """
         pass
-
+    
+    # 执行一步迭代剪枝
     def step(self, interactive=False):
         self.current_step += 1
+        # 首先分为全局和局部剪枝
         if self.global_pruning:
+            # 然后分为可交互和不可交互剪枝
             if interactive:
                 return self.prune_global()
             else:
@@ -202,9 +219,11 @@ class MetaPruner:
                 for group in self.prune_local():
                     group.prune()
 
+    # 调用重要性评估器评估当前组的重要性
     def estimate_importance(self, group, ch_groups=1, consecutive_groups=1):
         return self.importance(group, ch_groups=ch_groups, consecutive_groups=consecutive_groups)
 
+    # 检查group的稀疏度是否还需要剪枝
     def _check_sparsity(self, group):
         for dep, _ in group:
             module = dep.target.module
@@ -229,6 +248,7 @@ class MetaPruner:
                     return False
         return True
 
+    # 获取当前组的模块的操作分组数
     def get_channel_groups(self, group):
         if isinstance(self.channel_groups, int):
             return self.channel_groups
@@ -238,6 +258,7 @@ class MetaPruner:
                 return self.channel_groups[module]
         return 1  # no channel grouping
     
+    # 获取当前模块的连续通道分组
     def get_consecutive_groups(self, group):
         if isinstance(self.consecutive_groups, int):
             return self.consecutive_groups
@@ -247,9 +268,12 @@ class MetaPruner:
                 return self.consecutive_groups[module]
         return 1  # no channel grouping
 
+    # 局部剪枝
     def prune_local(self):
+        # 超过步数直接退出
         if self.current_step > self.iterative_steps:
             return
+        # 从依赖图中枚举所有的剪枝组
         for group in self.DG.get_all_groups(ignored_layers=self.ignored_layers, root_module_types=self.root_module_types, root_instances=self.root_instances):
             # check pruning rate
             if self._check_sparsity(group):
@@ -259,14 +283,17 @@ class MetaPruner:
                 ch_groups = self.get_channel_groups(group)
                 consecutive_groups = self.get_consecutive_groups(group)
                 imp = self.estimate_importance(group, ch_groups=ch_groups, consecutive_groups=consecutive_groups)
+                # print(imp.shape)
                 if imp is None: continue
                 current_channels = self.DG.get_out_channels(module)
                 target_sparsity = self.get_target_sparsity(module)
+                # 计算需要剪枝的通道数
                 n_pruned = current_channels - int(
                     self.layer_init_out_ch[module] *
                     (1 - target_sparsity)
                 )
-
+                # print(n_pruned, target_sparsity)
+                # 向下取整为round_to的倍数
                 if self.round_to:
                     n_pruned = n_pruned - (n_pruned % self.round_to)
                     
@@ -279,15 +306,20 @@ class MetaPruner:
                 if consecutive_groups > 1:
                     imp = imp.view(-1, consecutive_groups).sum(1)
 
+                # 获取将imp从小到大排序后的下标顺序
                 imp_argsort = torch.argsort(imp)
                 
                 if ch_groups > 1:
+                    # 通道分组对应的n_pruned也需要减少
                     pruning_idxs = imp_argsort[:(n_pruned//ch_groups)]
+                    # 计算通道分组的大小
                     group_size = current_channels//ch_groups
+                    # 在每一个通道分组中取对应的剪枝部分
                     pruning_idxs = torch.cat(
                         [pruning_idxs+group_size*i for i in range(ch_groups)], 0)
                 elif consecutive_groups > 1:
                     pruning_groups = imp_argsort[:(n_pruned//consecutive_groups)]
+                    # 和ch_groups，consecutive_groups直接描述每一个连续通道组的大小
                     group_size = consecutive_groups
                     pruning_idxs = torch.cat(
                         [torch.tensor([j+group_size*i for j in range(group_size)])
@@ -295,45 +327,63 @@ class MetaPruner:
                 else:
                     pruning_idxs = imp_argsort[:n_pruned]
 
+                # 获取pruning_fn对应的剪枝组，剪枝操作实际在这里执行
                 group = self.DG.get_pruning_group(
                     module, pruning_fn, pruning_idxs.tolist())
+                # 检查组以避免过度修剪。如果有足够的可prunable元素，则返回True。
                 if self.DG.check_pruning_group(group):
                     yield group
 
+    # 全局剪枝
     def prune_global(self):
+        # 如果当前步数已经大于迭代步数，直接退出
         if self.current_step > self.iterative_steps:
             return
         global_importance = []
+        # 枚举依赖图的每个组
         for group in self.DG.get_all_groups(ignored_layers=self.ignored_layers, root_module_types=self.root_module_types, root_instances=self.root_instances):
+            # 检查稀疏度，看是否还需要剪枝
             if self._check_sparsity(group):
                 ch_groups = self.get_channel_groups(group)
                 consecutive_groups = self.get_consecutive_groups(group)
+                # 评估当前组的重要性
                 imp = self.estimate_importance(group, ch_groups=ch_groups, consecutive_groups=consecutive_groups)
                 if imp is None: continue
                 if ch_groups > 1:
                     imp = imp[:len(imp)//ch_groups]
                 if consecutive_groups > 1:
                     imp = imp.view(-1, consecutive_groups).sum(1)
+                # 将评估结果添加到global_importance列表中
                 global_importance.append((group, ch_groups, consecutive_groups, imp))
 
+        # 取出重要性得分并cat
         imp = torch.cat([local_imp[-1]
                         for local_imp in global_importance], dim=0)
+        # print("meta-Pruner-img.shape:")
         print(imp.shape, len(global_importance))
+        # logging.info("meta-Pruner-img.shape:", imp.shape, len(global_importance))
+        # 当前目标稀疏度
         target_sparsity = self.per_step_ch_sparsity[self.current_step]
+        # 需要剪枝的通道数 即 总通道数减去要保留的通道数
         n_pruned = len(imp) - int(
             self.initial_total_channels *
             (1 - target_sparsity)
         )
+        # print("meta-Pruner-n_pruned:")
         print(n_pruned, target_sparsity, self.initial_total_channels)
+        # logging.info("meta-Pruner-n_pruned:", n_pruned, target_sparsity, self.initial_total_channels)
         if n_pruned <= 0:
             return
+        # 找出重要性最低的n_pruned个通道，返回值和下标
         topk_imp, _ = torch.topk(imp, k=n_pruned, largest=False)
         
         # global pruning through thresholding
+        # 需要剪掉的最大重要性
         thres = topk_imp[-1]
         for group, ch_groups, consecutive_groups, imp in global_importance:
             module = group[0][0].target.module
             pruning_fn = group[0][0].handler
+            # 需要剪枝的下标
             pruning_indices = (imp <= thres).nonzero().view(-1)
             
             if pruning_indices.size(-1) == 0:
@@ -347,11 +397,14 @@ class MetaPruner:
                 pruning_indices = torch.cat(
                     [torch.tensor([j+group_size*i for j in range(group_size)])
                     for i in pruning_indices], 0)
+            # 将剪枝下标向下取整成 round_to 的倍数
             if self.round_to:
                 n_pruned = len(pruning_indices)
                 n_pruned = n_pruned - (n_pruned % self.round_to)
                 pruning_indices = pruning_indices[:n_pruned]
+            # 获取pruning_fn对应的剪枝组，剪枝操作实际在这里执行
             group = self.DG.get_pruning_group(
                 module, pruning_fn, pruning_indices.tolist())
+            # 检查组以避免过度修剪。如果有足够的可prunable元素，则返回True。
             if self.DG.check_pruning_group(group):
                 yield group

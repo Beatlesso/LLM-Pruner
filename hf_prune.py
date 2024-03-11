@@ -51,7 +51,7 @@ def main(args):
         model.eval()
         with torch.no_grad():
             for prompt in prompts:
-                # "pt"返回torch.tensor  
+                # "pt"表示返回torch.tensor  
                 # {'input_ids': tensor([[   1,  306, 4658,  278, 6593,  310, 2834,  338]]), 'attention_mask': tensor([[1, 1, 1, 1, 1, 1, 1, 1]])}
                 # 输入的两个句子长度不一致，需要通过短句填充（padding）的方式让其长度一致
                 # attention_mask的作用就是用来标记哪些数据是补零的
@@ -104,18 +104,24 @@ def main(args):
         # 设置剪枝参数
         kwargs = {
             "importance": imp,
+            # 全局修剪选项（bool）：自适应稀疏性将根据其全局重要性等级分配给不同的层。
+            #        虽然这种策略可以提供性能优势，但它也有可能过度修剪特定层，导致整体性能大幅下降
             "global_pruning": args.global_pruning, 
             "iterative_steps": args.iterative_steps,
+            # 全局通道稀疏度
             "ch_sparsity": args.pruning_ratio, 
             "ignored_layers":[],
             "channel_groups": {
             },
+            # 自注意中的通道分组
             "consecutive_groups": {
                 layer.self_attn.q_proj: layer.self_attn.head_dim for layer in model.model.layers
             },
+            # dict，存放定制化模块和剪枝器pair
             "customized_pruners": {
                 LlamaRMSNorm: llama_pruner.hf_rmsnorm_pruner,
             },
+            # list，可剪枝的模块类型
             "root_module_types": None, 
             "root_instances": [model.model.layers[i].self_attn.q_proj for i in range(args.block_attention_layer_start, args.block_attention_layer_end)] +
                               [model.model.layers[i].mlp.gate_proj for i in range(args.block_mlp_layer_start, args.block_mlp_layer_end)]
@@ -202,7 +208,7 @@ def main(args):
             },
             "root_module_types": [LlamaRMSNorm, LlamaAttention],
         }
-
+        # 用torch_pruning 初始化剪枝器
         pruner = tp.pruner.MetaPruner(
             model,
             forward_prompts,

@@ -116,6 +116,7 @@ class OPTYPE(IntEnum):
     ELEMENTWISE = 8  # element-wise add, sub, etc.
     LN = 9  # nn.LayerNorm
     EMBED = 10  # nn.Embedding
+    # torch.nn.Parameter()将一个不可训练的tensor转换成可以训练的类型parameter，并将这个parameter绑定到这个module里面
     PARAMETER = 11  # nn.Parameter
     MHA = 12
     LSTM = 13

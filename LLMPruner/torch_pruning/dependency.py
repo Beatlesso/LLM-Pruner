@@ -12,6 +12,7 @@ from . import _helpers, utils, ops
 __all__ = ["Dependency", "Group", "DependencyGraph"]
 
 
+# 依赖图的结点
 class Node(object):
     """ Nodes of DepGraph
     """
@@ -31,16 +32,19 @@ class Node(object):
         self.enable_index_mapping = False
         self.pruning_dim = -1
 
+    # 被 @property 装饰的方法是获取属性值的方法，被装饰方法的名字会被用做 属性名
     @property
     def name(self):
         if self._name is None:
             return str(self.module)
         else:
             fmt = self._name
+            # 如果self.type不是可训练的参数，标注其模块名
             if self.type != ops.OPTYPE.PARAMETER:
                 fmt += " ({})".format(str(self.module))
             return fmt
 
+    # 将node添加到input中
     def add_input(self, node, allow_dumplicated=False):
         #if node not in self.inputs:
         if allow_dumplicated is True:
@@ -49,6 +53,7 @@ class Node(object):
             if node not in self.inputs:
                 self.inputs.append(node)
 
+    # 将node添加到output中
     def add_output(self, node, allow_dumplicated=False):
         if allow_dumplicated is True:
             self.outputs.append(node)
@@ -56,12 +61,14 @@ class Node(object):
             if node not in self.outputs:
                 self.outputs.append(node)
 
+    #  __repr__() 方法定义了打印实例化对象的输出信息
     def __repr__(self):
         return "<Node: ({})>".format(self.name)
-
+    # __str__() 方法用来返回对象的字符串表达式
     def __str__(self):
         return "<Node: ({})>".format(self.name)
 
+    # 输出当前node相关的详细信息，包括输入结点，输出结点，依赖（边），下标映射
     def details(self):
         fmt = "-" * 32 + "\n"
         fmt += "<Node: ({})>\n".format(self.name)
@@ -93,12 +100,19 @@ class Dependency(Edge):
         target: Node,
     ):
         """Layer dependency (Edge of DepGraph) in structral neural network pruning. 
+        结构神经网络修剪中的层依赖性（依赖图的边）
         Args:
             trigger (Callable): a pruning function that triggers this dependency
             handler (Callable): a pruning function that can fix the broken dependency
             source (Node): the source node pruned by the trigger function
             target (Node): the target node pruned by the handler function
             index_mapping (Callable): a callable function for index mapping
+
+            trigger（Callable）：一个修剪函数，触发此依赖关系
+            handler（Callable）：一个修剪函数，可以修复损坏的依赖关系
+            source（Node）：trigger函数修剪的源节点
+            target（Node）：handler函数修剪的目标节点
+            index_mapping（Callable）：用于索引映射的可调用函数
         """
         self.trigger = trigger
         self.handler = handler
@@ -106,6 +120,7 @@ class Dependency(Edge):
         self.target = target
         self.index_mapping = [None, None]
 
+    # 调用Dependency对象返回对应的handler
     def __call__(self, idxs: list, **kwargs):
         self.handler.__self__.pruning_dim = self.target.pruning_dim
         result = self.handler(
@@ -119,16 +134,18 @@ class Dependency(Edge):
         return str(self)
 
     def __str__(self):
+        # trigger on source => handler on target
         return "{} on {} => {} on {}".format(
             "None" if self.trigger is None else self.trigger.__name__,
             self.source.name,
             self.handler.__name__,
             self.target.name,
         )
-
+    # 判断当前 pruning_fn 触发依赖
     def is_triggered_by(self, pruning_fn):
         return pruning_fn == self.trigger
 
+    # 判断当前依赖和其他依赖是否相等
     def __eq__(self, other):
         return (
             self.source == other.source
@@ -136,7 +153,7 @@ class Dependency(Edge):
             and self.handler == other.handler
             and self.target == other.target
         )
-
+    # 哈希
     def __hash__(self):
         return hash((self.source, self.target, self.trigger, self.handler))
 
@@ -157,10 +174,12 @@ class Group(object):
 
     def prune(self, idxs=None, record_history=True, **kwargs):
         """Prune all coupled layers in the group
+        修剪组中的所有耦合层
         """
         if idxs is not None:
             module = self._group[0].dep.target.module
             pruning_fn = self._group[0].dep.handler
+            # 调用DependencyGraph的get_pruning_group方法
             new_group = self._DG.get_pruning_group(module, pruning_fn, idxs)
             new_group.prune()
         else:
@@ -186,22 +205,27 @@ class Group(object):
             root_module_name = self._DG._module2name[root_module]
             self._DG._pruning_history.append([root_module_name, self._DG.is_out_channel_pruning_fn(pruning_fn), root_pruning_idx])
 
+    # 添加依赖
     def add_dep(self, dep, idxs):
         self._group.append(GroupItem(dep=dep, idxs=idxs))
 
+    # 获取下标k的依赖
     def __getitem__(self, k):
         return self._group[k]
 
+    #  被 @property 装饰的方法是获取属性值的方法，被装饰方法的名字会被用做 属性名
     @property
     def items(self):
         return self._group
 
+    # 判断依赖是否在组中
     def has_dep(self, dep):
         for _dep, _ in self._group:
             if dep == _dep:
                 return True
         return False
 
+    # 判断组中是否有dep的剪枝操作
     def has_pruning_op(self, dep, idxs):
         for _dep, _idxs in self._group:
             if (
@@ -211,10 +235,11 @@ class Group(object):
             ):
                 return True
         return False
-
+    # 返回组的大小
     def __len__(self):
         return len(self._group)
 
+    # 将dep合并到当前group中，如果当前组内有相同target和handler的dep，则让其idx成为列表，并将其idxs添加到列表
     def add_and_merge(self, dep, idxs):
         for i, (_dep, _idxs) in enumerate(self._group):
             if _dep.target == dep.target and _dep.handler == dep.handler:
@@ -222,6 +247,7 @@ class Group(object):
                 return
         self.add_dep(dep, idxs)
 
+    # 将Group信息转化为字符串
     def __str__(self):
         fmt = ""
         fmt += "\n" + "-" * 32 + "\n"
@@ -232,6 +258,7 @@ class Group(object):
         fmt += "-" * 32 + "\n"
         return fmt
 
+    # 返回Group的字符串详细信息
     def details(self):
         fmt = ""
         fmt += "\n" + "-" * 32 + "\n"
@@ -249,6 +276,7 @@ class Group(object):
         """old interface, replaced by group.prune()"""
         self.prune()
 
+    # 直接调用Group对象将执行prune方法
     def __call__(self):
         return self.prune()
 
@@ -543,6 +571,7 @@ class DependencyGraph(object):
             p = self.REGISTERED_PRUNERS.get(ops.module2type(module), None)
         return p
 
+    # 获取模块或者结点的输出通道数
     def get_out_channels(self, module_or_node):
         if isinstance(module_or_node, Node):
             module = module_or_node.module

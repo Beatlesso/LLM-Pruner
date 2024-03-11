@@ -128,12 +128,14 @@ hf_linear_pruner = HFLinearPrunner()
 ##############################
 # Importance
 ##############################
+# 幅度重要性评估器
 class MagnitudeImportance(tp.importance.Importance):
     def __init__(self, p=2, group_reduction="mean", normalizer=None):
         self.p = p
         self.group_reduction = group_reduction
         self.normalizer = normalizer
 
+    # group_imp的归约操作
     def _reduce(self, group_imp):
         if self.group_reduction == "sum":
             group_imp = group_imp.sum(dim=0)
@@ -151,6 +153,7 @@ class MagnitudeImportance(tp.importance.Importance):
             raise NotImplementedError
         return group_imp
 
+    # 重要性评估函数
     @torch.no_grad()
     def __call__(self, group, ch_groups=1, consecutive_groups=1):
     

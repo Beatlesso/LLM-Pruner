@@ -20,6 +20,7 @@ from LLMPruner.evaluator.ppl import PPLMetric
 from LLMPruner.datasets.example_samples import get_examples
 from LLMPruner.templates.prompts import prompts
 
+# 为所有用到的随机数生成器设置随机种子
 def set_random_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -78,7 +79,7 @@ def main(args):
     # 所有参数都需要计算梯度
     for param in model.parameters():
         param.requires_grad_(True)
-    # numel()获取tensor中一共包含多少个元素   所以这里是计算剪枝之前的参数总量
+    # numel()获取tensor中一共包含多少个元素   所以这里是计算剪枝之前的可学习参数总量
     before_pruning_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     
     forward_prompts = torch.tensor([
@@ -113,7 +114,6 @@ def main(args):
             "ignored_layers":[],
             "channel_groups": {
             },
-            # 自注意中的通道分组
             "consecutive_groups": {
                 layer.self_attn.q_proj: layer.self_attn.head_dim for layer in model.model.layers
             },

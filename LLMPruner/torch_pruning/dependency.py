@@ -171,6 +171,8 @@ class Group(object):
     def __init__(self):
         self._group = list()
         self._DG = None # for group.prune(idxs=NEW_IDXS)
+        # 这个_DG会在get_pruning_group的时候被赋值为self
+        # 因为get_pruning_group是DependencyGraph的方法
 
     def prune(self, idxs=None, record_history=True, **kwargs):
         """Prune all coupled layers in the group
@@ -183,6 +185,7 @@ class Group(object):
             new_group = self._DG.get_pruning_group(module, pruning_fn, idxs)
             new_group.prune()
         else:
+            # 真正的剪枝操作
             for dep, idxs in self._group:
                 if dep.target.type == ops.OPTYPE.PARAMETER:
                     old_parameter = dep.target.module
@@ -282,8 +285,8 @@ class Group(object):
 
 UnwrappedParameters = namedtuple('UnwrappedParameters', ['parameters', 'pruning_dim'])
 
+# 依赖图
 class DependencyGraph(object):
-
     def __init__(self):
         _dummy_pruners = {
             ops.OPTYPE.CONCAT: ops.ConcatPruner(),
@@ -292,12 +295,13 @@ class DependencyGraph(object):
             ops.OPTYPE.RESHAPE: ops.ReshapePruner(),
             ops.OPTYPE.CUSTOMIZED: None,
         }
+        # REGISTERED_PRUNERS 记录支持的剪枝器
         self.REGISTERED_PRUNERS = function.PrunerBox.copy()  # shallow copy
         self.REGISTERED_PRUNERS.update(_dummy_pruners)
         self.CUSTOMIZED_PRUNERS = {}
         self.IGNORED_LAYERS = []
 
-        # cache
+        # cache  获取所有REGISTERED_PRUNERS和CUSTOMIZED_PRUNERS中的不重复in_channel_pruning_fn
         self._in_channel_pruning_fn = set([p.prune_in_channels for p in self.REGISTERED_PRUNERS.values() if p is not None] + [p.prune_in_channels for p in self.CUSTOMIZED_PRUNERS.values() if p is not None])
         self._out_channel_pruning_fn = set([p.prune_out_channels for p in self.REGISTERED_PRUNERS.values() if p is not None] + [p.prune_out_channels for p in self.CUSTOMIZED_PRUNERS.values() if p is not None])
         self._op_id = 0
@@ -305,23 +309,29 @@ class DependencyGraph(object):
         # Pruning History
         self._pruning_history = []
 
+    # 获取剪枝历史
     def pruning_history(self):
         return self._pruning_history
 
+    # 
     def load_pruning_history(self, pruning_history):
         self._pruning_history = pruning_history
         for module_name, is_out_channel_pruning, pruning_idx in self._pruning_history:
             module = self.model
+            # getattr(x, y) 函数用于返回对象x的属性值y
             for n in module_name.split('.'):
                 module = getattr(module, n)
+            # 通过模块获取对应的剪枝器
             pruner = self.get_pruner_of_module(module)
+            # 根据是否为输出通道剪枝划分pruning_fn
             if is_out_channel_pruning:
                 pruning_fn = pruner.prune_out_channels
             else:
                 pruning_fn = pruner.prune_in_channels
             group = self.get_pruning_group(module, pruning_fn, pruning_idx)
             group.prune(record_history=False)
-            
+
+    #  通过跟踪构建依赖图       
     def build_dependency(
         self,
         model: torch.nn.Module,
@@ -342,11 +352,12 @@ class DependencyGraph(object):
             output_transform (Callable): a function to transform network outputs.
             unwrapped_parameters (List): unwrapped nn.parameters defined by parameters.
             customized_pruners (typing.Dict[typing.Any, function.BasePruningFunc]): pruners for customized layers.
-            verbose (bool): verbose mode.
+            verbose (bool): verbose mode.  详细模式
         """
 
         self.verbose = verbose
         self.model = model
+        # 模块到名字映射的字典
         self._module2name = {module: name for (
             name, module) in model.named_modules()}
 
@@ -364,7 +375,8 @@ class DependencyGraph(object):
                         if sub_module != m:
                             self.IGNORED_LAYERS.append(sub_module)
 
-        # Detect unwrapped nn.parameters
+
+        # Detect unwrapped nn.parameters   
         wrapped_parameters = []
         prunable_module_types = self.REGISTERED_PRUNERS.keys()
         for m in self.model.modules():
@@ -372,7 +384,9 @@ class DependencyGraph(object):
             if ( op_type in prunable_module_types and op_type!=ops.OPTYPE.ELEMENTWISE ) or m.__class__ in self.CUSTOMIZED_PRUNERS.keys():
                 wrapped_parameters.extend(list(m.parameters()))
         unwrapped_detected = []
+        # 参数本身到参数名称的反向映射字典
         _param_to_name = {}
+        # named_parameters()返回模块参数的迭代器，同时生成参数的名称和参数本身。
         for name, p in self.model.named_parameters():
             is_wrapped = False
             for p_wrapped in wrapped_parameters:
@@ -385,18 +399,22 @@ class DependencyGraph(object):
         if unwrapped_parameters is None:
             unwrapped_parameters = []
         self._param_to_name = _param_to_name
+        # set3 = set1 - set2，即set3中包括所有不在set2中出现的set1中的元素
         unwrapped_detected = list( set(unwrapped_detected) - set([p for (p, _) in unwrapped_parameters]) )
         if len(unwrapped_detected)>0 and self.verbose:
             warnings.warn("Unwrapped parameters detected: {}.\n Torch-Pruning will prune the last non-singleton dimension of a parameter. If you wish to customize this behavior, please provide an unwrapped_parameters argument.".format([_param_to_name[p] for p in unwrapped_detected]))
         for p in unwrapped_detected:
             # get the last dimension that >1
             def last_non_singleton_dim(tensor):
+                # 取出所有维度不是1的维度的下标
                 non_singleton_dims = [i for i, s in enumerate(tensor.shape) if s > 1]
                 return non_singleton_dims[-1] if non_singleton_dims else None
             pruning_dim = last_non_singleton_dim(p)
             if pruning_dim is not None:
                 unwrapped_parameters.append( UnwrappedParameters(parameters=p, pruning_dim=pruning_dim) ) # prune the last non-singleton dim by daufault
         self.unwrapped_parameters = unwrapped_parameters
+
+
         # Build computational graph by tracing.
         self.module2node = self._trace(
             model, example_inputs, forward_fn, output_transform=output_transform
@@ -418,6 +436,7 @@ class DependencyGraph(object):
         layer_pruner: function.BasePruningFunc,
     ):
         """Register a customized pruner
+            注册定制化剪枝器
         Args:
             layer_type (class): the type of target layer
             pruner (tp.pruner.BasePruningFunc): a pruner for the specified layer type.
@@ -472,8 +491,10 @@ class DependencyGraph(object):
             pruning_fn (Callable): the pruning function.
             idxs (list or tuple): the indices of channels/dimensions.
         """
+        # 特判
         if isinstance(module, ops.TORCH_CONV) and module.groups == module.out_channels:
             pruning_fn = function.prune_depthwise_conv_out_channels
+        # 只有一个数，将其变成列表
         if isinstance(idxs, Number):
             idxs = [idxs]
 
@@ -487,6 +508,7 @@ class DependencyGraph(object):
         )
         visited_node = set()
 
+        # 非递归修复依赖图
         def _fix_dependency_graph_non_recursive(dep, idxs):
             processing_stack = [(dep, idxs)]
             while len(processing_stack) > 0:
@@ -514,6 +536,7 @@ class DependencyGraph(object):
                                 (new_dep, new_indices)
                             )
 
+        # 这里传入的就是root dep 和 idxs
         _fix_dependency_graph_non_recursive(*group[0])
 
         # merge pruning ops
@@ -668,13 +691,16 @@ class DependencyGraph(object):
             # This is implictly implemented by assigning
             # prune_out_channels=prune_in_channels in tp.pruner.function.BasePruningFunc
 
+
     def _trace(self, model, example_inputs, forward_fn, output_transform):
         """ Tracing the model as a graph
+        跟踪模型创建计算图
         """
         model.eval()
         gradfn2module = {}
         visited = {}
         self._2d_4d = True # only for pytorch<=1.8
+        # 记录函数
         def _record_grad_fn(module, inputs, outputs):
             if module not in visited:
                 visited[module] = 1
@@ -688,10 +714,12 @@ class DependencyGraph(object):
                 outputs = outputs[0]
             if isinstance(outputs, torch.nn.utils.rnn.PackedSequence):
                 outputs = outputs.data
+            # 梯度函数到模块的映射
             gradfn2module[outputs.grad_fn] = module
 
         registered_types = tuple(ops.type2class(
             t) for t in self.REGISTERED_PRUNERS.keys()) + tuple(self.CUSTOMIZED_PRUNERS.keys())
+        # register_forward_hook 作用：获取forward过程中每层的输入和输出
         hooks = [
             m.register_forward_hook(_record_grad_fn)
             for m in model.modules()
@@ -711,14 +739,18 @@ class DependencyGraph(object):
 
         for hook in hooks:
             hook.remove()
+        
         # for recursive models or layers
+        # 记录被多次vis的模块或者层
         reused = [m for (m, count) in visited.items() if count > 1]
 
         # build graph
         if output_transform is not None:
             out = output_transform(out)
 
+        # 
         module2node = {}
+        # 将out展开成列表
         for o in utils.flatten_as_list(out):
             self._trace_computational_graph(
                 module2node, o.grad_fn, gradfn2module, reused)
@@ -744,9 +776,11 @@ class DependencyGraph(object):
                                     stack.append(ni)
         return module2node
 
+
     def _trace_computational_graph(self, module2node, grad_fn_root, gradfn2module, reused):
 
         def create_node_if_not_exists(grad_fn):
+            # 如果module和grad_fn以及node已经建立link，并且没有被多次vis，直接返回对应node
             module = gradfn2module.get(grad_fn, None)
             if module is not None \
                 and module in module2node \

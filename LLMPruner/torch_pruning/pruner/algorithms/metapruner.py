@@ -11,25 +11,41 @@ from ... import ops, dependency
 
 class MetaPruner:
     """
-        Meta Pruner for structural pruning.
+        Meta pruner for structural pruning. 
 
         Args:
-            model (nn.Module): A to-be-pruned model
-            example_inputs (torch.Tensor or List): dummy inputs for graph tracing.
-            importance (Callable): importance estimator.
-            global_pruning (bool): enable global pruning. 
-            ch_sparsity (float): global channel sparisty.
-            ch_sparsity_dict (Dict[nn.Module, float]): layer-specific sparsity.
-            iterative_steps (int): number of steps for iterative pruning.
-            iterative_sparsity_scheduler (Callable): scheduler for iterative pruning.
-            max_ch_sparsity (float): maximum channel sparsity.
-            ignored_layers (List[nn.Module]): ignored modules.
 
-            round_to (int): channel rounding.
-            customized_pruners (dict): a dict containing module-pruner pairs.
-            unwrapped_parameters (list): nn.Parameter that does not belong to any supported layers.
-            root_module_types (list): types of prunable modules.
-            output_transform (Callable): A function to transform network outputs.
+            # Basic
+            * model (nn.Module): A to-be-pruned model
+            * example_inputs (torch.Tensor or List): dummy inputs for graph tracing.
+            * importance (Callable): importance estimator. 
+            * global_pruning (bool): enable global pruning. Default: False.
+            * pruning_ratio (float): global channel sparisty. Also known as pruning ratio. Default: 0.5.
+            * pruning_ratio_dict (Dict[nn.Module, float]): layer-specific pruning ratio. Will cover pruning_ratio if specified. Default: None.
+            * max_pruning_ratio (float): the maximum pruning ratio. Default: 1.0.
+            * iterative_steps (int): number of steps for iterative pruning. Default: 1.
+            * iterative_pruning_ratio_scheduler (Callable): scheduler for iterative pruning. Default: linear_scheduler.
+            * ignored_layers (List[nn.Module | typing.Type]): ignored modules. Default: None.
+            * round_to (int): round channels to the nearest multiple of round_to. E.g., round_to=8 means channels will be rounded to 8x. Default: None.
+            
+            # Advanced
+            * in_channel_groups (Dict[nn.Module, int]): The number of channel groups for layer input. Default: dict().
+            * out_channel_groups (Dict[nn.Module, int]): The number of channel groups for layer output. Default: dict().
+            * num_heads (Dict[nn.Module, int]): The number of heads for multi-head attention. Default: dict().
+            * prune_num_heads (bool): remove entire heads in multi-head attention. Default: False.
+            * prune_head_dims (bool): remove head dimensions in multi-head attention. Default: True.
+            * head_pruning_ratio (float): head pruning ratio. Default: 0.0.
+            * head_pruning_ratio_dict (Dict[nn.Module, float]): layer-specific head pruning ratio. Default: None.
+            * customized_pruners (dict): a dict containing module-pruner pairs. Default: None.
+            * unwrapped_parameters (dict): a dict containing unwrapped parameters & pruning dims. Default: None.
+            * root_module_types (list): types of prunable modules. Default: [nn.Conv2d, nn.Linear, nn.LSTM].
+            * forward_fn (Callable): A function to execute model.forward. Default: None.
+            * output_transform (Callable): A function to transform network outputs. Default: None.
+
+            # Deprecated
+            * channel_groups (Dict[nn.Module, int]): output channel grouping. Default: dict().
+            * ch_sparsity (float): the same as pruning_ratio. Default: None.
+            * ch_sparsity_dict (Dict[nn.Module, float]): the same as pruning_ratio_dict. Default: None.
         """
 
     def __init__(
@@ -53,7 +69,8 @@ class MetaPruner:
         round_to: int = None,  # round channels to 8x, 16x, ...
         # for grouped channels.  记录不同模块分组操作（比如分组卷积）的分组数
         channel_groups: typing.Dict[nn.Module, int] = dict(),
-        # for consecutive channels.
+        # for consecutive channels. 
+        # layer.self_attn.q_proj: layer.self_attn.head_dim for layer in model.model.layers
         consecutive_groups: typing.Dict[nn.Module, int] = dict(),
         # pruners for customized layers
         customized_pruners: typing.Dict[typing.Any,
@@ -81,14 +98,16 @@ class MetaPruner:
         self.round_to = round_to
 
         # Build dependency graph
-        # 首先构造输入，前向运行一次模型，得到模型对应的计算依赖图
+        # 首先构造输入，前向运行一次模型，得到模型对应的依赖图
         self.DG = dependency.DependencyGraph().build_dependency(
             model,
             example_inputs=example_inputs,
-            forward_fn=forward_fn,
+            forward_fn=forward_fn,  # forward_fn如果为None，out = model(**example_inputs)
             output_transform=output_transform,
-            unwrapped_parameters=unwrapped_parameters,
-            customized_pruners=customized_pruners,
+            # unwrapped_parameters可以用于指定未封装在标准nn中的参数的修剪维度
+            # 比如Transformers中的cls_token和Conv Next的layer_scale
+            unwrapped_parameters=unwrapped_parameters, 
+            customized_pruners=customized_pruners,  # 如果有customized_pruners用于特定层的剪枝器，在DG上注册一下就好
         )
         '''
         list1 = ['Google', 'Runoob', 'Taobao']
@@ -108,9 +127,10 @@ class MetaPruner:
         self.current_step = 0
 
         # Record initial status
+        # 记录每个层初始的输入和输出维度
         self.layer_init_out_ch = {}
         self.layer_init_in_ch = {}
-        # module2node：通过跟踪构建计算图
+        # module2node：模块到依赖图结点的字典
         for m in self.DG.module2node.keys():
             # module2type：获取模块对应的类型
             if ops.module2type(m) in self.DG.REGISTERED_PRUNERS:
@@ -134,7 +154,7 @@ class MetaPruner:
                     # prunable_types是获取所有子模块中支持剪枝的模块类别元组集合
                     prunable_types = tuple([ops.type2class(
                         prunable_type) for prunable_type in self.DG.REGISTERED_PRUNERS.keys()])
-                    # 如果子模块是支持的，那么为其添加定制的迭代稀疏调度
+                    # 如果子模块是支持剪枝的，那么为其添加定制的迭代稀疏调度
                     if isinstance(submodule, prunable_types):
                         self.ch_sparsity_dict[submodule] = self.iterative_sparsity_scheduler(
                             sparsity, self.iterative_steps
@@ -143,6 +163,10 @@ class MetaPruner:
         # model.modules()迭代遍历模型的所有nn.Module子类
         # detect group convs & group norms
         # 检测分组卷积核分组norm 并且获取它们的分组数
+                        
+        # 这里要求 m.groups != m.out_channels 的原因应该是如果分组数和输出通道一样
+        # 那么每个组只对应一个输出通道，而原本是要求所有组都必须保持相同的大小
+        # 这个时候修剪输出通道就相当于直接将该组删除，就不存在要手动处理的额外依赖了 
         for m in self.model.modules():
             if isinstance(m, ops.TORCH_CONV) \
                 and m.groups > 1 \
@@ -151,18 +175,18 @@ class MetaPruner:
             if isinstance(m, ops.TORCH_GROUPNORM):
                 self.channel_groups[m] = m.num_groups
         
-        # 如果启用全局剪枝
+        # 启用全局剪枝
         if self.global_pruning: # TODO: Support both ch_groups and consecutive_groups in a single forward
+            # 统计所有分组中的可剪枝通道数
             initial_total_channels = 0
-            # self.DG.get_all_groups获取所有的分组
+            # self.DG.get_all_groups 获取所有的依赖分组
             for group in self.DG.get_all_groups(ignored_layers=self.ignored_layers, root_module_types=self.root_module_types, root_instances=self.root_instances):
                 # 获取当前组的模块的操作分组数
                 ch_groups = self.get_channel_groups(group)
-                # 获取当前组的模块的连续分组
                 consecutive_groups = self.get_consecutive_groups(group)
                 # utils.count_prunable_out_channels( group[0][0].target.module )
 
-                # 根据情况更新总通道数，因为模块操作分组会划分成不同的依赖组
+                # 根据情况更新总通道数，其中模块操作分组会划分到同一个依赖组，因此其对应的可剪枝通道数要除以组数
                 if ch_groups > 1:
                     initial_total_channels += (self.DG.get_out_channels(
                         group[0][0].target.module) // ch_groups)
@@ -174,14 +198,15 @@ class MetaPruner:
                 
             self.initial_total_channels = initial_total_channels
         
+        # 启用index映射
         if enable_index_mapping:
             for node in self.DG.module2node.values():
                 node.enable_index_mapping = True
     
-    # 获取剪枝历史
+
     def pruning_history(self):
         return self.DG.pruning_history()
-    # 加载剪枝历史
+
     def load_pruning_history(self, pruning_history):
         self.DG.load_pruning_history(pruning_history)
 
@@ -207,9 +232,9 @@ class MetaPruner:
         # 首先分为全局和局部剪枝
         if self.global_pruning:
             # 然后分为可交互和不可交互剪枝
-            if interactive:
+            if interactive: # 交互模式返回生成器对象，可以在group.prune()之前做一些自己想做的事情
                 return self.prune_global()
-            else:
+            else: # 非交互模式直接遍历完生成器并执行 group.prune()
                 for group in self.prune_global():
                     group.prune()
         else:
@@ -258,7 +283,7 @@ class MetaPruner:
                 return self.channel_groups[module]
         return 1  # no channel grouping
     
-    # 获取当前模块的连续通道分组
+    # 获取当前模块的连续分组数
     def get_consecutive_groups(self, group):
         if isinstance(self.consecutive_groups, int):
             return self.consecutive_groups
@@ -277,6 +302,7 @@ class MetaPruner:
         for group in self.DG.get_all_groups(ignored_layers=self.ignored_layers, root_module_types=self.root_module_types, root_instances=self.root_instances):
             # check pruning rate
             if self._check_sparsity(group):
+                # 获取组的root依赖
                 module = group[0][0].target.module
                 pruning_fn = group[0][0].handler
 
@@ -293,13 +319,13 @@ class MetaPruner:
                     (1 - target_sparsity)
                 )
                 # print(n_pruned, target_sparsity)
-                # 向下取整为round_to的倍数
                 if self.round_to:
                     n_pruned = n_pruned - (n_pruned % self.round_to)
                     
                 if n_pruned <= 0:
                     continue
-
+                
+                # 如果需要分组，我们看第一个分组的通道即可，因为额外依赖已经考虑
                 if ch_groups > 1:
                     imp = imp[:len(imp)//ch_groups]
 
@@ -327,7 +353,7 @@ class MetaPruner:
                 else:
                     pruning_idxs = imp_argsort[:n_pruned]
 
-                # 获取pruning_fn对应的剪枝组，剪枝操作实际在这里执行
+                # 获取pruning_fn对应的剪枝组
                 group = self.DG.get_pruning_group(
                     module, pruning_fn, pruning_idxs.tolist())
                 # 检查组以避免过度修剪。如果有足够的可prunable元素，则返回True。
@@ -402,7 +428,7 @@ class MetaPruner:
                 n_pruned = len(pruning_indices)
                 n_pruned = n_pruned - (n_pruned % self.round_to)
                 pruning_indices = pruning_indices[:n_pruned]
-            # 获取pruning_fn对应的剪枝组，剪枝操作实际在这里执行
+            # 获取pruning_fn对应的剪枝组
             group = self.DG.get_pruning_group(
                 module, pruning_fn, pruning_indices.tolist())
             # 检查组以避免过度修剪。如果有足够的可prunable元素，则返回True。
